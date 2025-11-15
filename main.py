@@ -111,9 +111,21 @@ async def sms_webhook(
 
     # 2) Onboarding / verification flow
     if not user.is_verified:
-        # CASE A: We don't know their Emory email yet → treat this message as the email "keyword"
+        # CASE A: We don't know their Emory email yet → treat this message as email step
         if user.emory_email is None:
-            em = body.strip().lower()
+            em_raw = body.strip()
+            em = em_raw.lower()
+
+            # 1) If it doesn't even look like an email → welcome + instructions
+            if "@" not in em or "." not in em.split("@")[-1]:
+                resp.message(
+                    "Welcome to TrypSync! To use this service, reply with your "
+                    "Emory email ending in @emory.edu.\n\n"
+                    "Example: akhil.arularasu@emory.edu"
+                )
+                return Response(content=str(resp), media_type="application/xml")
+
+            # 2) It looks like an email, but not an Emory email → Emory-only message
             if not em.endswith("@emory.edu"):
                 resp.message(
                     "TrypSync is currently only available to the Emory community. "
@@ -122,14 +134,12 @@ async def sms_webhook(
                 )
                 return Response(content=str(resp), media_type="application/xml")
 
-
-            # Save email & generate OTP
+            # 3) Valid Emory email → save & send OTP
             user.emory_email = em
             code = generate_otp()
             user.otp_code = code
             db.commit()
 
-            # Send the verification code to their Emory email (NOT via SMS)
             send_verification_email(user.emory_email, code)
 
             resp.message(
@@ -138,15 +148,15 @@ async def sms_webhook(
             )
             return Response(content=str(resp), media_type="application/xml")
 
-        # CASE B (simplified): Email is known, expecting this SMS to be the OTP.
-        # No separate regeneration branch; this keeps state logic tight.
+        # CASE B: We already know their Emory email → expect OTP in this message
         if body == (user.otp_code or ""):
             user.is_verified = True
-            user.otp_code = None  # clear OTP after success
+            user.otp_code = None
             db.commit()
+
             resp.message(
-                "You're verified ✅ as an Emory student. From now on, just text us "
-                "your ride requests from Emory to ATL airport.\n\n"
+                "You're verified ✅ as an Emory community member! "
+                "From now on, just send us your ride requests from Emory to ATL.\n\n"
                 "Example: '8:30pm, 3 people'."
             )
             return Response(content=str(resp), media_type="application/xml")
@@ -157,11 +167,9 @@ async def sms_webhook(
             )
             return Response(content=str(resp), media_type="application/xml")
 
-    # 3) Already verified → treat SMS as ride request (for now: placeholder)
-    #    Later, you'll parse `body` into requested_time + party_size and write a RideRequest row.
+    # 3) Already verified → treat message as a ride request (placeholder for now)
     resp.message(
         "You're already verified ✅. "
         "Send your ride request like: '8:30pm, 3 people' and we'll match you."
     )
     return Response(content=str(resp), media_type="application/xml")
-
