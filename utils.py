@@ -9,136 +9,239 @@ from sqlalchemy.orm import Session
 # Adjust this import if you're using a package structure, e.g.:
 # from app.models import User, Rides
 from models import User, Rides
-
+import json
+import google.generativeai as genai
+import os
+from twilio.rest import Client
+from dotenv import load_dotenv
 
 # utils.py
+
+load_dotenv()
 
 EMORY_NAME = "Emory University"
 AIRPORT_NAME = "Hartsfield-Jackson Atlanta International Airport"
 
+ALLOWED_LOCATIONS = {EMORY_NAME, AIRPORT_NAME}
 
-def parse_route(message: str) -> tuple[str, str]:
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")  # e.g. "whatsapp:+1415xxxxxxx"
+
+twilio_client = None
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+
+def send_whatsapp_message(to_number: str, body: str) -> None:
     """
-    Parse from/to locations from the free-form message.
-
-    We only support two endpoints for now:
-      - Emory University
-      - Hartsfield-Jackson Atlanta International Airport
-
-    Logic:
-      - If both 'emory' and 'airport/atl/hartsfield/jackson' appear:
-          whichever appears first in the text is treated as FROM,
-          the other as TO.
-      - If only one of them appears:
-          - 'emory' only  -> Emory -> Airport
-          - airport/atl only -> Airport -> Emory
-      - If neither appears: default Emory -> Airport.
+    Send a WhatsApp message via Twilio to the given number.
+    Expects numbers like 'whatsapp:+14045551234'.
     """
-    text = message.lower()
-
-    # Detect mentions
-    has_emory = "emory" in text
-    has_airport_word = any(
-        kw in text for kw in ["airport", "hartsfield", "jackson", "atl"]
-    )
-
-    # Helper to get earliest index of any airport-like keyword
-    def airport_index(t: str) -> int:
-        indices = [
-            t.find("airport"),
-            t.find("hartsfield"),
-            t.find("jackson"),
-            t.find("atl"),
-        ]
-        indices = [i for i in indices if i != -1]
-        return min(indices) if indices else -1
-
-    if has_emory and has_airport_word:
-        idx_emory = text.find("emory")
-        idx_airport = airport_index(text)
-
-        if idx_emory != -1 and idx_airport != -1:
-            if idx_emory < idx_airport:
-                # "emory ... airport"
-                return EMORY_NAME, AIRPORT_NAME
-            else:
-                # "airport ... emory"
-                return AIRPORT_NAME, EMORY_NAME
-
-    # Only one side mentioned → assume other side is the opposite point
-    if has_emory and not has_airport_word:
-        return EMORY_NAME, AIRPORT_NAME
-
-    if has_airport_word and not has_emory:
-        return AIRPORT_NAME, EMORY_NAME
-
-    # Fallback: default Emory → Airport
-    return EMORY_NAME, AIRPORT_NAME
-
-
-def parse_ride_datetime(message: str) -> Optional[datetime]:
-    """
-    Parse a datetime from a free-form SMS message.
-
-    Supports things like:
-      - "leaving at 3 PM on 11/16 from Emory to airport"
-      - "11/16 3:30pm"
-      - "3 pm 11/16"
-
-    Assumes the ride is in the current year if year not provided.
-    Returns a naive datetime (no timezone) or None if parsing fails.
-    """
-    text = message.lower()
-
-    # Time like "3 pm", "3:30pm", "11 am", "11:05 pm"
-    time_match = re.search(r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b', text)
-    # Date like "11/16" or "11/16/2025"
-    date_match = re.search(r'\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b', text)
-
-    if not time_match or not date_match:
-        return None
-
-    hour = int(time_match.group(1))
-    minute = int(time_match.group(2) or 0)
-    ampm = time_match.group(3)
-
-    # Convert to 24-hour
-    if ampm == "pm" and hour != 12:
-        hour += 12
-    if ampm == "am" and hour == 12:
-        hour = 0
-
-    month = int(date_match.group(1))
-    day = int(date_match.group(2))
-    year_str = date_match.group(3)
-
-    if year_str:
-        year = int(year_str)
-        if year < 100:  # e.g. "/25" → 2025
-            year += 2000
-    else:
-        year = datetime.now().year
+    if not twilio_client or not TWILIO_WHATSAPP_NUMBER:
+        print("[TWILIO] Missing config; would have sent to", to_number, ":", body)
+        return
 
     try:
-        return datetime(year, month, day, hour, minute)
-    except ValueError:
-        # Invalid date like 13/40/2025 etc.
+        twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=to_number,
+            body=body,
+        )
+    except Exception as e:
+        print(f"[TWILIO] Error sending WhatsApp message to {to_number}: {e}")
+
+def build_sms_deeplink(phone_number: str) -> str:
+    """
+    Convert something like 'whatsapp:+14045551234' or '+14045551234'
+    into an sms: deep link that opens Messages/iMessage.
+    """
+    num = phone_number
+    if num.startswith("whatsapp:"):
+        num = num[len("whatsapp:"):]
+    return f"sms:{num}"
+
+
+def _get_gemini_model():
+    """
+    Lazily configure and return a Gemini model instance.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        # In dev, fail gracefully if key is missing
+        print("[GEMINI] GEMINI_API_KEY is not set; falling back to None.")
         return None
 
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    return model
+
+def _extract_json_from_text(text: str) -> Optional[dict]:
+    """
+    Gemini may wrap JSON in code fences or extra text.
+    This helper extracts the first {...} block and parses it.
+    """
+    text = text.strip()
+
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        # e.g. ```json\n{...}\n```
+        text = text.strip("`")
+        # After stripping backticks, try to find first '{'
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    json_str = text[start : end + 1]
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        return None
+
+def _normalize_location(raw: Optional[str]) -> Optional[str]:
+    """
+    Map Gemini's location output or synonyms into one of the canonical names,
+    or return None if we can't confidently map it.
+    """
+    if not raw:
+        return None
+
+    t = raw.strip().lower()
+
+    # Direct canonical matches
+    if "emory" in t:
+        return EMORY_NAME
+
+    if any(kw in t for kw in ["airport", "hartsfield", "jackson", "atl"]):
+        return AIRPORT_NAME
+
+    # If Gemini already returned exact canonical name
+    if raw in ALLOWED_LOCATIONS:
+        return raw
+
+    return None
+
+
+def parse_ride_with_gemini(message: str) -> Optional[dict]:
+    """
+    Use Gemini to parse a free-form ride request message into:
+        - departure_time: datetime (Python datetime object)
+        - from_location: canonical name
+        - to_location: canonical name
+
+    Returns:
+        dict with keys {"departure_time", "from_location", "to_location"}
+        or None on failure.
+    """
+    model = _get_gemini_model()
+    if model is None:
+        return None
+
+    # You can make this dynamic if you want, but for now we'll just use current year info.
+    now = datetime.now()
+    current_date_str = now.strftime("%Y-%m-%d")
+    current_year = now.year
+
+    system_prompt = f"""
+You are a strict JSON parser for a ride-sharing service between two locations:
+
+  1. "Emory University"
+  2. "Hartsfield-Jackson Atlanta International Airport"
+
+The user will send a short text message describing a ride, for example:
+- "955 AM 11/19 atl airport to emory"
+- "leaving 3 pm on 11/16 from emory to airport"
+- "airport to emory tomorrow 9pm"
+- "11/23 8pm emory → atl airport"
+
+You MUST extract:
+  - a single departure datetime (assume the timezone is America/New_York)
+  - a FROM location
+  - a TO location
+
+Rules:
+  - If the message says "emory", "emory univ", or similar, map it to "Emory University".
+  - If the message says "airport", "atl airport", "hartsfield", or "jackson",
+    map it to "Hartsfield-Jackson Atlanta International Airport".
+  - If both sides are mentioned, the first mentioned is the FROM location,
+    and the second is the TO location.
+  - If only one location is mentioned:
+      - "from emory" or "leaving emory" => FROM: Emory University, TO: Airport
+      - "to emory" or "going to emory"  => FROM: Airport, TO: Emory University
+  - If the year is omitted in the date, assume the current year: {current_year}.
+  - If the message uses relative words like "today" or "tomorrow", interpret them
+    relative to today's date: {current_date_str}.
+  - The only valid output locations are:
+      - "Emory University"
+      - "Hartsfield-Jackson Atlanta International Airport"
+
+Output format:
+  - Output ONLY a single JSON object with EXACTLY these fields:
+    {{
+      "success": true or false,
+      "reason": "<short reason if success is false>",
+      "departure_time": "YYYY-MM-DDTHH:MM:SS" or null,
+      "from_location": "<one of the allowed locations or null>",
+      "to_location": "<one of the allowed locations or null>"
+    }}
+
+Do NOT include any additional keys.
+Do NOT include any explanation outside the JSON.
+"""
+
+    user_prompt = f"User message: {message!r}"
+
+    try:
+        response = model.generate_content([system_prompt, user_prompt])
+        raw_text = response.text or ""
+        print("[GEMINI RAW RESPONSE]", raw_text)  # 👈 add this HERE
+    except Exception as e:
+        print(f"[GEMINI] Error during generate_content: {e}")
+        return None
+
+    data = _extract_json_from_text(raw_text)
+    if not data:
+        print("[GEMINI] Failed to extract JSON from response.")
+        return None
+
+    if not data.get("success"):
+        print(f"[GEMINI] Model reported failure: {data.get('reason')}")
+        return None
+
+    # Normalize and validate locations
+    raw_from = data.get("from_location")
+    raw_to = data.get("to_location")
+
+    from_location = _normalize_location(raw_from)
+    to_location = _normalize_location(raw_to)
+
+    if from_location not in ALLOWED_LOCATIONS or to_location not in ALLOWED_LOCATIONS:
+        print(f"[GEMINI] Invalid locations: from={raw_from}, to={raw_to}")
+        return None
+
+    # Parse datetime
+    dt_str = data.get("departure_time")
+    if not dt_str:
+        print("[GEMINI] Missing departure_time in JSON.")
+        return None
+
+    try:
+        departure_dt = datetime.fromisoformat(dt_str)
+    except Exception as e:
+        print(f"[GEMINI] Failed to parse datetime '{dt_str}': {e}")
+        return None
+
+    return {
+        "departure_time": departure_dt,
+        "from_location": from_location,
+        "to_location": to_location,
+    }
 
 def format_departure_time(dt: datetime) -> str:
-    """
-    Format a datetime for human-readable SMS responses.
-    Example: '11/16 03:30 PM'
-    """
     return dt.strftime("%m/%d %I:%M %p")
 
-
 def get_active_ride_for_user(db: Session, user_id: int) -> Optional[Rides]:
-    """
-    Return the user's most recent 'active' ride, where status is 'pending' or 'matched'.
-    If none exists, return None.
-    """
     return (
         db.query(Rides)
         .filter(
@@ -151,8 +254,10 @@ def get_active_ride_for_user(db: Session, user_id: int) -> Optional[Rides]:
 
 
 def find_matching_ride(db: Session, new_ride: Rides) -> Optional[Rides]:
-    from datetime import timedelta
-
+    """
+    Given a newly created ride, find another 'pending' ride from a different user
+    whose departure_time is within a ±30 minute window and has the same route.
+    """
     window = timedelta(minutes=30)
     start = new_ride.departure_time - window
     end = new_ride.departure_time + window
@@ -173,29 +278,49 @@ def find_matching_ride(db: Session, new_ride: Rides) -> Optional[Rides]:
     )
 
 def create_ride_and_try_match(db: Session, user: User, body: str) -> str:
-    # 1) One active ride per user
+    """
+    Core ride creation logic using Gemini for parsing.
+
+    - Enforces one active ride (pending/matched) per user.
+    - Uses Gemini to parse datetime + from/to locations.
+    - Creates a new ride.
+    - Attempts to match with another pending ride within ±30 minutes,
+      with the same route (from/to).
+    - Sends intro DMs to both riders when a match is found.
+    - Returns a string message to send back via Twilio.
+    """
+    # 0) First, mark any old rides in the past as completed
+    complete_past_rides_for_user(db, user.id)
+
+
+    # 1) Check if user already has an active ride
     active_ride = get_active_ride_for_user(db, user.id)
     if active_ride:
         return (
             "You already have a ride on file.\n\n"
             f"Departure: {format_departure_time(active_ride.departure_time)} "
-            f"{active_ride.from_location} → {active_ride.to_location}.\n"
-            "If you need to change it, reply 'cancel' (coming soon) and then send a new request."
+            f"{active_ride.from_location} → {active_ride.to_location}.\n\n"
+            "You can cancel your ride at any time by replying 'cancel', "
+            "then send a new request."
         )
 
-    # 2) Parse datetime
-    ride_dt = parse_ride_datetime(body)
-    if not ride_dt:
+    # 2) Parse with Gemini
+    parsed = parse_ride_with_gemini(body)
+    print("[DEBUG] Gemini returned →", parsed)
+
+    if not parsed:
         return (
-            "I couldn't understand your date/time 😅.\n\n"
-            "Please send something like: "
+            "I couldn't understand your date/time or route 😅.\n\n"
+            "Try something like: '955 AM 11/19 atl airport to emory' or "
             "'leaving at 3 PM on 11/16 from Emory to airport'."
         )
+    
+    # TEMP: echo back what we parsed
+    ride_dt = parsed["departure_time"]
+    from_location = parsed["from_location"]
+    to_location = parsed["to_location"]
 
-    # 3) Parse route (from/to)
-    from_location, to_location = parse_route(body)
-
-    # 4) Create new ride
+    # 3) Create new ride
     new_ride = Rides(
         user_id=user.id,
         original_message=body,
@@ -210,10 +335,11 @@ def create_ride_and_try_match(db: Session, user: User, body: str) -> str:
     db.commit()
     db.refresh(new_ride)
 
-    # 5) Try to find a match
+    # 4) Try to find a matching pending ride
     other = find_matching_ride(db, new_ride)
 
     if other:
+        # Mark both as matched and cross-link
         new_ride.status = "matched"
         new_ride.matched_with_ride_id = other.id
 
@@ -222,18 +348,144 @@ def create_ride_and_try_match(db: Session, user: User, body: str) -> str:
 
         db.commit()
 
-        # ⬇️ this is the FIRST return block you posted
+        # --- Intro DMs for both riders ---
+        try:
+            db.refresh(new_ride)
+            db.refresh(other)
+
+            user1 = new_ride.user
+            user2 = other.user
+
+            name1 = user1.full_name or "another student"
+            name2 = user2.full_name or "another student"
+
+            phone1 = user1.phone_number  # "whatsapp:+1..."
+            phone2 = user2.phone_number
+
+            sms_link_for_2 = build_sms_deeplink(phone2)
+            sms_link_for_1 = build_sms_deeplink(phone1)
+
+            trip_str = f"{format_departure_time(ride_dt)} {from_location} → {to_location}"
+
+            # Message to rider 1 about rider 2
+            body_for_1 = (
+                "Good news! 🎉 You've been matched with another student for your ride.\n\n"
+                f"Match: {name2}\n"
+                f"Phone: {phone2}\n"
+                f"Trip: {trip_str}\n\n"
+                "You can start a WhatsApp or iMessage group with them to coordinate.\n"
+                f"Tap-to-text (SMS/iMessage): {sms_link_for_2}"
+            )
+            send_whatsapp_message(phone1, body_for_1)
+
+            # Message to rider 2 about rider 1
+            body_for_2 = (
+                "Good news! 🎉 You've been matched with another student for your ride.\n\n"
+                f"Match: {name1}\n"
+                f"Phone: {phone1}\n"
+                f"Trip: {trip_str}\n\n"
+                "You can start a WhatsApp or iMessage group with them to coordinate.\n"
+                f"Tap-to-text (SMS/iMessage): {sms_link_for_1}"
+            )
+            send_whatsapp_message(phone2, body_for_2)
+
+        except Exception as e:
+            print("[MATCH DM] Failed to send intro messages:", e)
+
         return (
-            "Good news! 🎉 We found another Emory student with a similar ride.\n\n"
+            "Good news! 🎉 We found another student with a similar ride.\n\n"
             f"Your ride: {format_departure_time(ride_dt)} "
             f"{from_location} → {to_location}.\n"
-            "We’ll introduce you both shortly so you can coordinate."
+            "We just sent you both a message with each other's contact info so you can coordinate."
         )
     else:
-        # ⬇️ this is the SECOND return block you posted
         return (
             "Got it ✅ Your ride request is saved.\n\n"
             f"Departure: {format_departure_time(ride_dt)} "
             f"{from_location} → {to_location}.\n"
-            "We'll match you with another Emory student as soon as someone compatible joins."
+            "We'll match you with another student as soon as someone compatible joins."
         )
+
+def cancel_active_ride(db: Session, user: User) -> str:
+    """
+    If the user has an active ride (pending or matched), mark it as cancelled.
+    If the ride was matched with someone else, put the other rider back to 'pending'
+    and clear their matched_with_ride_id, and notify them that we're rematching them.
+    """
+    # First, auto-complete any past rides so we only cancel future ones
+    complete_past_rides_for_user(db, user.id)
+
+    active_ride = get_active_ride_for_user(db, user.id)
+    if not active_ride:
+        return "You don't have any active ride to cancel."
+
+    other = None
+    if active_ride.status == "matched" and active_ride.matched_with_ride_id:
+        other = (
+            db.query(Rides)
+            .filter(Rides.id == active_ride.matched_with_ride_id)
+            .one_or_none()
+        )
+        if other:
+            if other.status == "matched":
+                other.status = "pending"
+            if other.matched_with_ride_id == active_ride.id:
+                other.matched_with_ride_id = None
+
+    # Cancel this user's ride
+    active_ride.status = "cancelled"
+    active_ride.matched_with_ride_id = None
+
+    db.commit()
+
+    # Notify the other rider (if any) that we are rematching them
+    if other:
+        try:
+            db.refresh(other)
+            other_user = other.user
+            other_phone = other_user.phone_number
+            sms_link = build_sms_deeplink(other_phone)
+
+            msg = (
+                "Heads up: your previous match had to cancel their ride, "
+                "so we're rematching you with another rider.\n\n"
+                f"Your ride is still active for "
+                f"{format_departure_time(other.departure_time)} "
+                f"{other.from_location} → {other.to_location}.\n\n"
+                f"You'll be notified again once a new match is found."
+            )
+            send_whatsapp_message(other_phone, msg)
+        except Exception as e:
+            print("[TWILIO] Failed to notify other rider about cancel:", e)
+
+    return (
+        "Your ride has been cancelled ✅.\n\n"
+        f"Original departure: {format_departure_time(active_ride.departure_time)} "
+        f"{active_ride.from_location} → {active_ride.to_location}."
+    )
+
+
+def complete_past_rides_for_user(db: Session, user_id: int) -> None:
+    """
+    For this user, mark any pending/matched rides in the past as 'completed'.
+    This keeps get_active_ride_for_user from treating old rides as active.
+    """
+    now = datetime.utcnow()
+
+    past_rides = (
+        db.query(Rides)
+        .filter(
+            Rides.user_id == user_id,
+            Rides.status.in_(["pending", "matched"]),
+            Rides.departure_time <= now,
+        )
+        .all()
+    )
+
+    if not past_rides:
+        return
+
+    for ride in past_rides:
+        ride.status = "completed"
+
+    db.commit()

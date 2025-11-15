@@ -31,6 +31,12 @@ app = FastAPI()
 # Helpers
 # -----------------------
 
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")  # e.g. "whatsapp:+1415xxxxxxx"
+
+
+
 
 def generate_otp() -> str:
     """Generate a 6-digit zero-padded OTP as a string."""
@@ -117,30 +123,53 @@ async def sms_webhook(
 
     # 2) Onboarding / verification flow
     if not user.is_verified:
-        # CASE A: We don't know their Emory email yet → treat this message as email step
+        # STEP 1: Ask for their full name first
+        if user.full_name is None:
+            name = body.strip()
+
+            # If this doesn't look like a full name yet (no space, too short),
+            # just treat this as the initial ping ("hi", "hey", etc.)
+            # and prompt them for their full name.
+            if " " not in name or len(name) < 3:
+                resp.message(
+                    "Welcome to TrypSync! 🚕\n\n"
+                    "To get started, please reply with your full name "
+                    "(for example: 'Akhil Arularasu')."
+                )
+                return Response(content=str(resp), media_type="application/xml")
+
+            # Looks like a real name → save it
+            user.full_name = name
+            db.commit()
+
+            resp.message(
+                f"Nice to meet you, {name}! 🎉\n\n"
+                "Now please reply with your Emory email ending in @emory.edu."
+            )
+            return Response(content=str(resp), media_type="application/xml")
+
+        # STEP 2: We know their name but not their email → treat message as email step
         if user.emory_email is None:
             em_raw = body.strip()
             em = em_raw.lower()
 
-            # 1) If it doesn't even look like an email → welcome + instructions
+            # 1) If it doesn't even look like an email → instructions
             if "@" not in em or "." not in em.split("@")[-1]:
                 resp.message(
-                    "Welcome to TrypSync! To use this service, reply with your "
-                    "Emory email ending in @emory.edu.\n\n"
+                    "Please reply with your Emory email ending in @emory.edu.\n\n"
                     "Example: akhil.arularasu@emory.edu"
                 )
                 return Response(content=str(resp), media_type="application/xml")
 
-            # 2) It looks like an email, but not an Emory email → Emory-only message
-            if not em.endswith("@emory.edu"):
+            # 2) Allowed domain: Emory only (Gatech allowed silently for your testing)
+            if not em.endswith(("@emory.edu", "@gatech.edu")):
                 resp.message(
-                    "TrypSync is currently only available to the Emory community. "
-                    "Please reply with a valid Emory email ending in @emory.edu.\n\n"
-                    "Example: akhil.arularasu@emory.edu"
+                    "The TrypSync service is currently only available to Emory students.\n\n"
+                    "Please reply with a valid Emory email ending in @emory.edu."
                 )
                 return Response(content=str(resp), media_type="application/xml")
 
-            # 3) Valid Emory email → save & send OTP
+            # 3) Valid email → save & send OTP
             user.emory_email = em
             code = generate_otp()
             user.otp_code = code
@@ -149,21 +178,22 @@ async def sms_webhook(
             send_verification_email(user.emory_email, code)
 
             resp.message(
-                f"Thanks! We sent a 6-digit code to {user.emory_email}. "
+                f"Thanks {user.full_name}! We sent a 6-digit code to {user.emory_email}. "
                 "Reply with that code here to verify your account."
             )
             return Response(content=str(resp), media_type="application/xml")
 
-        # CASE B: We already know their Emory email → expect OTP in this message
-        if body == (user.otp_code or ""):
+        # STEP 3: We know name + email → expect OTP in this message
+        if body.strip() == (user.otp_code or ""):
             user.is_verified = True
             user.otp_code = None
             db.commit()
 
             resp.message(
-                "You're verified ✅ as an Emory community member! "
-                "From now on, just send us your ride requests from Emory to ATL.\n\n"
-                "Example: '8:30pm on 11/16/2025, 3 people'."
+                f"You're verified ✅, {user.full_name}!\n\n"
+                "From now on, just send your ride requests like:\n"
+                "'8:30 am 11/17 emory to airport'.\n\n"
+                "You can cancel your ride at any time by replying 'cancel'."
             )
             return Response(content=str(resp), media_type="application/xml")
         else:
@@ -174,6 +204,16 @@ async def sms_webhook(
             return Response(content=str(resp), media_type="application/xml")
 
 
+    # 3) User is verified at this point
+
+    # If they type "cancel" -> cancel active ride instead of creating a new one
+    if body.strip().lower() == "cancel":
+        from utils import cancel_active_ride  # put at top of file instead
+        msg = cancel_active_ride(db, user)
+        resp.message(msg)
+        return Response(content=str(resp), media_type="application/xml")
+
+    # Otherwise treat message as a ride request
     response_text = create_ride_and_try_match(db, user, body)
     resp.message(response_text)
     return Response(content=str(resp), media_type="application/xml")
