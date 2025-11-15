@@ -19,25 +19,39 @@ class User(Base):
     otp_code = Column(String(6), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     # Relationship to ride requests (optional for now, but useful later)
-    ride_requests = relationship("RideRequest", back_populates="user")
+    rides = relationship("Rides", back_populates="user")
 
 
-class RideRequest(Base):
-    """
-    Stub model for later when you start storing actual ride intents like
-    '8:30pm, 3 people'.
-    Right now we won't use it in main.py yet, but it's here for when
-    you're ready to parse Body into structured data.
-    """
-    __tablename__ = "ride_requests"
+class Rides(Base):
+    __tablename__ = "rides"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    user = relationship("User", back_populates="ride_requests")
-    # When they want to leave Emory (you'll parse from SMS later)
-    requested_time = Column(DateTime, nullable=True)
-    # How many people in their party (1–4), you'll fill this from SMS text
-    party_size = Column(Integer, nullable=True)
-    status = Column(String(20), nullable=False, default="pending")
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
+    # FK link to user
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user = relationship("User", back_populates="rides")
+
+    # Original text the user sent
+    original_message = Column(String(500), nullable=False)
+
+    # Fixed for now: Emory → ATL
+    from_location = Column(String(100), nullable=False, default="Emory University")
+    to_location = Column(
+        String(150),
+        nullable=False,
+        default="Hartsfield-Jackson Atlanta International Airport",
+    )
+
+    # Full datetime of departure (parsed from SMS)
+    departure_time = Column(DateTime, nullable=False)
+
+    # Always 1 person for now
+    party_size = Column(Integer, nullable=False, default=1)
+
+    # pending → matched → completed → cancelled
+    status = Column(String(20), nullable=False, default="pending")
+
+    # If matched, which other ride is it linked to?
+    matched_with_ride_id = Column(Integer, ForeignKey("rides.id"), nullable=True)
+
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
