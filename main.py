@@ -3,7 +3,7 @@ import os
 import random
 from datetime import datetime
 from fastapi import FastAPI, Depends, Form
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from twilio.twiml.messaging_response import MessagingResponse
 from database import Base, engine, get_db
@@ -12,6 +12,7 @@ import os
 from dotenv import load_dotenv
 import smtplib
 from email.message import EmailMessage
+
 
 load_dotenv()  # loads variables from a .env file into os.environ
 
@@ -87,7 +88,7 @@ TrypSync
 # -----------------------
 
 
-@app.post("/sms", response_class=PlainTextResponse)
+@app.post("/sms")
 async def sms_webhook(
     From: str = Form(...),   # Twilio sends "From" as the sender's phone number
     Body: str = Form(""),    # Twilio sends "Body" as the message text
@@ -117,11 +118,12 @@ async def sms_webhook(
             em = body.strip().lower()
             if not em.endswith("@emory.edu"):
                 resp.message(
-                    "Welcome to TrypSync! To use this service, reply with your "
-                    "Emory email ending in @emory.edu.\n"
+                    "TrypSync is currently only available to the Emory community. "
+                    "Please reply with a valid Emory email ending in @emory.edu.\n\n"
                     "Example: akhil.arularasu@emory.edu"
                 )
                 return str(resp)
+
 
             # Save email & generate OTP
             user.emory_email = em
