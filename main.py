@@ -1,7 +1,7 @@
 import os
 
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, Depends, Form
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
@@ -11,6 +11,12 @@ from models import User
 from dotenv import load_dotenv
 import smtplib
 from email.message import EmailMessage
+import re
+from database import SessionLocal
+from models import User, Rides
+from utils import create_ride_and_try_match  # 👈 import from utils
+
+
 
 load_dotenv()  # loads variables from a .env file into os.environ
 
@@ -157,7 +163,7 @@ async def sms_webhook(
             resp.message(
                 "You're verified ✅ as an Emory community member! "
                 "From now on, just send us your ride requests from Emory to ATL.\n\n"
-                "Example: '8:30pm, 3 people'."
+                "Example: '8:30pm on 11/16/2025, 3 people'."
             )
             return Response(content=str(resp), media_type="application/xml")
         else:
@@ -167,9 +173,7 @@ async def sms_webhook(
             )
             return Response(content=str(resp), media_type="application/xml")
 
-    # 3) Already verified → treat message as a ride request (placeholder for now)
-    resp.message(
-        "You're already verified ✅. "
-        "Send your ride request like: '8:30pm, 3 people' and we'll match you."
-    )
+
+    response_text = create_ride_and_try_match(db, user, body)
+    resp.message(response_text)
     return Response(content=str(resp), media_type="application/xml")
