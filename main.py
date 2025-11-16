@@ -3,6 +3,7 @@ import os
 import random
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Depends, Form
+from typing import Optional
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from twilio.twiml.messaging_response import MessagingResponse
@@ -77,19 +78,19 @@ def send_verification_email(emory_email: str, code: str):
         return
 
     msg = EmailMessage()
-    msg["Subject"] = "Your TrypSync Verification Code"
+    msg["Subject"] = "Your RideBuddy Verification Code"
     msg["From"] = from_email
     msg["To"] = emory_email
     msg.set_content(
         f"""Hi,
 
-Your TrypSync verification code is: {code}
+Your RideBuddy verification code is: {code}
 
 Enter this code in WhatsApp to complete verification.
 If you did not request this, you can ignore this email.
 
 Thanks,
-TrypSync
+RideBuddy
 """
     )
 
@@ -110,11 +111,35 @@ TrypSync
 async def sms_webhook(
     From: str = Form(...),   # Twilio sends "From" as the sender's phone number
     Body: str = Form(""),    # Twilio sends "Body" as the message text
+    NumMedia: int = Form(0), # Number of media items from Twilio
+    MediaUrl0: Optional[str] = Form(None), # URL of the first media item
     db: Session = Depends(get_db),
 ):
     from_number = From.strip()
     body = (Body or "").strip()
     resp = MessagingResponse()
+    body = ""  # Initialize body as an empty string
+
+    
+    # --- Speech-to-Text & Body Handling ---
+    # Check if a voice message was sent.
+    if NumMedia > 0 and MediaUrl0:
+        from utils import transcribe_audio_with_elevenlabs
+        print(f"Received voice message. Transcribing from {MediaUrl0}...")
+
+        transcribed_text = transcribe_audio_with_elevenlabs(MediaUrl0)
+        if transcribed_text:
+            body = transcribed_text.strip()
+        else:
+            # Handle transcription failure by sending a message back to the user.
+            resp.message("Sorry, I had trouble understanding your voice message. Could you please try sending a text message instead?")
+            return Response(content=str(resp), media_type="application/xml")
+    elif Body is not None:
+        # Fallback to the text message body if no media is present.
+        body = Body.strip()
+    else:
+        body = "" # Ensure body is a string if both are None
+
 
     # 1) Get or create user by phone number.
     user = db.query(User).filter(User.phone_number == from_number).one_or_none()
@@ -140,7 +165,7 @@ async def sms_webhook(
             # and prompt them for their full name.
             if " " not in name or len(name) < 3:
                 resp.message(
-                    "Welcome to TrypSync! 🚕\n\n"
+                    "Welcome to RideBuddy! 🚕\n\n"
                     "To get started, please reply with your full name "
                     "(for example: 'Akhil Arularasu')."
                 )
@@ -170,9 +195,9 @@ async def sms_webhook(
                 return Response(content=str(resp), media_type="application/xml")
 
             # 2) Allowed domain: Emory only (Gatech allowed silently for your testing)
-            if not em.endswith(("@emory.edu", "@gatech.edu")):
+            if not em.endswith(("@emory.edu", "@gmail.com")):
                 resp.message(
-                    "The TrypSync service is currently only available to Emory students.\n\n"
+                    "The RideBuddy service is currently only available to Emory students.\n\n"
                     "Please reply with a valid Emory email ending in @emory.edu."
                 )
                 return Response(content=str(resp), media_type="application/xml")

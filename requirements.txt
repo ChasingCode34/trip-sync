@@ -6,3 +6,5 @@ twilio
 python-multipart
 google-generativeai
 psycopg2-binary
+elevenlabs
+requests

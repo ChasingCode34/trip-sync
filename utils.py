@@ -3,19 +3,16 @@
 import re
 from datetime import datetime, timedelta
 from typing import Optional
-
+import requests
+from elevenlabs.client import ElevenLabs
 from sqlalchemy.orm import Session
-
-# Adjust this import if you're using a package structure, e.g.:
-# from app.models import User, Rides
 from models import User, Rides
 import json
 import google.generativeai as genai
 import os
 from twilio.rest import Client
 from dotenv import load_dotenv
-
-# utils.py
+from io import BytesIO
 
 load_dotenv()
 
@@ -27,11 +24,16 @@ ALLOWED_LOCATIONS = {EMORY_NAME, AIRPORT_NAME}
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")  # e.g. "whatsapp:+1415xxxxxxx"
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+
 
 twilio_client = None
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
+elevenlabs_client = None
+if ELEVENLABS_API_KEY:
+    elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
 def send_whatsapp_message(to_number: str, body: str) -> None:
     """
@@ -50,6 +52,50 @@ def send_whatsapp_message(to_number: str, body: str) -> None:
         )
     except Exception as e:
         print(f"[TWILIO] Error sending WhatsApp message to {to_number}: {e}")
+
+
+    def transcribe_audio_with_elevenlabs(audio_url: str) -> Optional[str]:
+        if not elevenlabs_client:
+            print("[ELEVENLABS] API client not configured. Skipping transcription.")
+            return None
+
+        try:
+            print(f"[ELEVENLABS] Downloading audio from: {audio_url}")
+            auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+            resp = requests.get(audio_url, auth=auth)
+            resp.raise_for_status()
+            audio_data = resp.content
+
+            audio_file = BytesIO(audio_data)
+
+            print("[ELEVENLABS] Transcribing audio with Scribe...")
+            # **Use model_id, not model**
+            result = elevenlabs_client.speech_to_text.convert(
+                file=audio_file,
+                model_id="scribe_v1"
+            )
+
+            # The API returns a JSON-like object with a "text" field. :contentReference[oaicite:2]{index=2}  
+            transcript = None
+            if isinstance(result, dict):
+                transcript = result.get("text", "")
+            else:
+                # In case result isn't a dict (but likely it is)
+                try:
+                    transcript = getattr(result, "text", "")
+                except Exception:
+                    transcript = str(result)
+
+            transcript = transcript or ""
+            print(f"[ELEVENLABS] Transcription result: '{transcript}'")
+            return transcript
+
+        except requests.exceptions.RequestException as e:
+            print(f"[ELEVENLABS] Failed to download audio file: {e}")
+            return None
+        except Exception as e:
+            print(f"[ELEVENLABS] Error during transcription: {e}")
+            return None
 
 def build_sms_deeplink(phone_number: str) -> str:
     """
@@ -72,6 +118,7 @@ def _get_gemini_model():
         print("[GEMINI] GEMINI_API_KEY is not set; falling back to None.")
         return None
 
+   # print("[GEMINI] GEMINI_API_KEY found, configuring client.")
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-2.5-flash")
     return model
@@ -303,6 +350,65 @@ def get_active_ride_for_user(db: Session, user_id: int) -> Optional[Rides]:
         .first()
     )
 
+def perform_match_and_notify(db: Session, ride1: Rides, ride2: Rides) -> None:
+    """
+    Mark two rides as matched, cross-link them, commit,
+    and send the intro WhatsApp messages to both riders.
+    """
+    # We'll treat ride1 as the "primary" for trip summary
+    ride_dt = ride1.departure_time
+    from_location = ride1.from_location
+    to_location = ride1.to_location
+
+    # Mark both as matched and cross-link
+    ride1.status = "matched"
+    ride1.matched_with_ride_id = ride2.id
+
+    ride2.status = "matched"
+    ride2.matched_with_ride_id = ride1.id
+
+    db.commit()
+    db.refresh(ride1)
+    db.refresh(ride2)
+
+    # Fetch users
+    user1 = ride1.user
+    user2 = ride2.user
+
+    name1 = user1.full_name or "another student"
+    name2 = user2.full_name or "another student"
+
+    phone1 = user1.phone_number
+    phone2 = user2.phone_number
+
+    sms_link_for_2 = build_sms_deeplink(phone2)
+    sms_link_for_1 = build_sms_deeplink(phone1)
+
+    trip_str = f"{format_departure_time(ride_dt)} {from_location} → {to_location}"
+
+    # Message to rider 1 about rider 2
+    body_for_1 = (
+        "Good news! 🎉 You've been matched with another student for your ride.\n\n"
+        f"Match: {name2}\n"
+        f"Phone: {phone2}\n"
+        f"Trip: {trip_str}\n\n"
+        "You can start a WhatsApp or iMessage group with them to coordinate.\n"
+        f"Tap-to-text (SMS/iMessage): {sms_link_for_2}"
+    )
+    send_whatsapp_message(phone1, body_for_1)
+
+    # Message to rider 2 about rider 1
+    body_for_2 = (
+        "Good news! 🎉 You've been matched with another student for your ride.\n\n"
+        f"Match: {name1}\n"
+        f"Phone: {phone1}\n"
+        f"Trip: {trip_str}\n\n"
+        "You can start a WhatsApp or iMessage group with them to coordinate.\n"
+        f"Tap-to-text (SMS/iMessage): {sms_link_for_1}"
+    )
+    send_whatsapp_message(phone2, body_for_2)
+
+
 
 def find_matching_ride(db: Session, new_ride: Rides) -> Optional[Rides]:
     """
@@ -390,60 +496,17 @@ def create_ride_and_try_match(db: Session, user: User, body: str) -> str:
     other = find_matching_ride(db, new_ride)
 
     if other:
-        # Mark both as matched and cross-link
-        new_ride.status = "matched"
-        new_ride.matched_with_ride_id = other.id
-
-        other.status = "matched"
-        other.matched_with_ride_id = new_ride.id
-
-        db.commit()
-
-        # --- Intro DMs for both riders ---
         try:
-            db.refresh(new_ride)
-            db.refresh(other)
-
-            user1 = new_ride.user
-            user2 = other.user
-
-            name1 = user1.full_name or "another student"
-            name2 = user2.full_name or "another student"
-
-            phone1 = user1.phone_number  # "whatsapp:+1..."
-            phone2 = user2.phone_number
-
-            sms_link_for_2 = build_sms_deeplink(phone2)
-            sms_link_for_1 = build_sms_deeplink(phone1)
-
-            trip_str = f"{format_departure_time(ride_dt)} {from_location} → {to_location}"
-
-            # Message to rider 1 about rider 2
-            body_for_1 = (
-                "Good news! 🎉 You've been matched with another student for your ride.\n\n"
-                f"Match: {name2}\n"
-                f"Phone: {phone2}\n"
-                f"Trip: {trip_str}\n\n"
-                "You can start a WhatsApp or iMessage group with them to coordinate.\n"
-                f"Tap-to-text (SMS/iMessage): {sms_link_for_2}"
-            )
-            send_whatsapp_message(phone1, body_for_1)
-
-            # Message to rider 2 about rider 1
-            body_for_2 = (
-                "Good news! 🎉 You've been matched with another student for your ride.\n\n"
-                f"Match: {name1}\n"
-                f"Phone: {phone1}\n"
-                f"Trip: {trip_str}\n\n"
-                "You can start a WhatsApp or iMessage group with them to coordinate.\n"
-                f"Tap-to-text (SMS/iMessage): {sms_link_for_1}"
-            )
-            send_whatsapp_message(phone2, body_for_2)
-
+            perform_match_and_notify(db, new_ride, other)
         except Exception as e:
             print("[MATCH DM] Failed to send intro messages:", e)
 
-        return None
+        return (
+            "Good news! 🎉 We found another student with a similar ride.\n\n"
+            f"Your ride: {format_departure_time(ride_dt)} "
+            f"{from_location} → {to_location}.\n"
+            "We just sent you both a message with each other's contact info so you can coordinate."
+        )
     else:
         return (
             "Got it ✅ Your ride request is saved.\n\n"
@@ -451,6 +514,7 @@ def create_ride_and_try_match(db: Session, user: User, body: str) -> str:
             f"{from_location} → {to_location}.\n"
             "We'll match you with another student as soon as someone compatible joins."
         )
+
 
 def cancel_active_ride(db: Session, user: User) -> str:
     """
@@ -484,31 +548,41 @@ def cancel_active_ride(db: Session, user: User) -> str:
 
     db.commit()
 
-    # Notify the other rider (if any) that we are rematching them
+    # If there was a partner, try to instantly rematch them with someone else
     if other:
-        try:
-            db.refresh(other)
-            other_user = other.user
-            other_phone = other_user.phone_number
-            sms_link = build_sms_deeplink(other_phone)
+        # Make sure we use the latest DB state
+        db.refresh(other)
 
-            msg = (
-                "Heads up: your previous match had to cancel their ride, "
-                "so we're rematching you with another rider.\n\n"
-                f"Your ride is still active for "
-                f"{format_departure_time(other.departure_time)} "
-                f"{other.from_location} → {other.to_location}.\n\n"
-                f"You'll be notified again once a new match is found."
-            )
-            send_whatsapp_message(other_phone, msg)
-        except Exception as e:
-            print("[TWILIO] Failed to notify other rider about cancel:", e)
+        new_match = find_matching_ride(db, other)
+        if new_match:
+            try:
+                perform_match_and_notify(db, other, new_match)
+            except Exception as e:
+                print("[MATCH DM] Failed to send intro messages on rematch:", e)
+        else:
+            # Optional: notify them their ride is still active but waiting
+            try:
+                other_user = other.user
+                other_phone = other_user.phone_number
+
+                msg = (
+                    "Heads up: your previous match had to cancel their ride, "
+                    "so we're rematching you with another rider.\n\n"
+                    f"Your ride is still active for "
+                    f"{format_departure_time(other.departure_time)} "
+                    f"{other.from_location} → {other.to_location}.\n\n"
+                    "You'll be notified again once a new match is found."
+                )
+                send_whatsapp_message(other_phone, msg)
+            except Exception as e:
+                print("[TWILIO] Failed to notify other rider about cancel:", e)
 
     return (
         "Your ride has been cancelled ✅.\n\n"
         f"Original departure: {format_departure_time(active_ride.departure_time)} "
         f"{active_ride.from_location} → {active_ride.to_location}."
     )
+
 
 
 def complete_past_rides_for_user(db: Session, user_id: int) -> None:
